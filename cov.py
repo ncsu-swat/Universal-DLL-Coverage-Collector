@@ -50,13 +50,14 @@ class DLLCovCollector:
 
     def classify_python_files_with_itv(self, pattern: Optional[str] = None) -> Dict[str, int]:
         """
-        Walk self.target for Python files, obtain their creation time from file metadata,
+                Walk self.target for Python files, obtain their creation time (using file modification
+                time via os.path.getmtime) from file metadata,
         bucket them using self.itv seconds starting at the minimum timestamp found, and
         move files into self.result_dir/<start-end>/... preserving their relative paths.
 
         Notes:
-        - On Linux, true creation time (birth time) may be unavailable; we fall back to
-          st_ctime (inode change time) or st_mtime when st_birthtime is not present.
+                - On many systems (especially Linux), true creation/birth time is unavailable; we
+                    therefore use modification time (os.path.getmtime) as a proxy for creation time.
         - If multiple files share the same name from different subdirectories, we
           preserve the relative directory structure under each bucket to avoid collisions.
 
@@ -78,16 +79,16 @@ class DLLCovCollector:
         regex = re.compile(pattern) if pattern else None
 
         def get_creation_time(path: str) -> float:
-            st = os.stat(path)
-            # Prefer st_birthtime if available (macOS, some filesystems), else fall back
-            # to st_ctime (change time on Unix) and, as a last resort, st_mtime.
-            birth = getattr(st, "st_birthtime", None)
-            if birth is not None:
-                return float(birth)
-            # On Linux, getctime == st_ctime which is change time; still acceptable as a proxy
+            """Return the chosen timestamp for bucketing.
+
+            Per request, we use modification time as the canonical timestamp:
+            os.path.getmtime(path) -> float seconds since epoch.
+            """
             try:
-                return float(os.path.getctime(path))
+                return float(os.path.getmtime(path))
             except Exception:
+                # Fallback: stat and use st_mtime directly if getmtime fails
+                st = os.stat(path)
                 return float(st.st_mtime)
 
         # 1) Collect all Python files and their times
@@ -118,7 +119,9 @@ class DLLCovCollector:
 
         # 2) Determine bucket boundaries relative to the minimum timestamp
         min_ts = min(ts for _p, ts in py_files)
+        print("min_ts:", min_ts)
         max_ts = max(ts for _p, ts in py_files)
+        print("max_ts:", max_ts)
         # Max range in seconds from min
         max_span = int(max_ts - min_ts)
         # Precompute bucket label helper
@@ -128,7 +131,7 @@ class DLLCovCollector:
             end = start + self.itv
             return f"{start}-{end}"
 
-        # 3) Move files into bucketed directories, preserving relative paths
+        # 3) Copy files into bucketed directories, preserving relative paths
         counts: Dict[str, int] = {}
         for full, ts in py_files:
             label = bucket_label(ts)
@@ -151,13 +154,13 @@ class DLLCovCollector:
                     dest_path = os.path.join(dest_dir, f"{base}__{i}{ext}")
                     i += 1
 
-            shutil.move(full, dest_path)
+            shutil.copy(full, dest_path)
 
         # Optionally, report the overall range for visibility
         total = len(py_files)
         bucket_count = len(counts)
         print(
-            f"Classified and moved {total} Python files into {bucket_count} buckets under '{self.result_dir}'.\n"
+            f"Classified and copied {total} Python files into {bucket_count} buckets under '{self.result_dir}'.\n"
             f"Time span: 0-{((max_span // self.itv) + 1) * self.itv} seconds from minimum timestamp."
         )
         return counts
