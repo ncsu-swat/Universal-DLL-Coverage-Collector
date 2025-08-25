@@ -43,6 +43,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="_result",
         help="Output directory to write results",
     )
+    parser.add_argument(
+        "--baseline",
+        type=str,
+        required=False,
+        default=None,
+        help="Baseline method",
+    )
+    parser.add_argument(
+        "--itv",
+        type=int,
+        default=60,
+        required=False,
+        help="Interval in seconds for classifying Python files",
+    )
     return parser
 
 
@@ -62,6 +76,8 @@ if __name__ == "__main__":
             "ver": parsed_args.ver,
             "target": str(parsed_args.target),
             "output": str(parsed_args.output),
+            "baseline": str(parsed_args.baseline),
+            "itv": parsed_args.itv,
         },
     )
     
@@ -70,6 +86,9 @@ if __name__ == "__main__":
         collector = cov.DLLCovCollector(
             ver=parsed_args.ver,
             target=parsed_args.target,
-            output=parsed_args.output
+            output=parsed_args.output,
+            baseline=parsed_args.baseline,
+            dll=parsed_args.dll,
+            itv=parsed_args.itv
         )
         collector.collect()

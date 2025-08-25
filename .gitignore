@@ -12,3 +12,5 @@ output
 __pycache__
 .mypy_cache
 .piix
+
+_result
