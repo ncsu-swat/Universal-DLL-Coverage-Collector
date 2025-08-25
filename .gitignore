@@ -1,0 +1,14 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+output
+.vscode
+__pycache__
+.mypy_cache
+.piix
+output
+.vscode
+__pycache__
+.mypy_cache
+.piix
