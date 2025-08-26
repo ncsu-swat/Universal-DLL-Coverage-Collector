@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y \
     clang \
     llvm \
     patchelf \
+    btop \
     && rm -rf /var/lib/apt/lists/*
 
 # Make python3.11 the default python

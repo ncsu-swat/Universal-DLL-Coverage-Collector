@@ -22,6 +22,7 @@ RUN apt-get update && \
     python3.10 \
     python3.10-dev \
     cmake \
+    btop \
     # python3.10-distutils is not available on Ubuntu 24.04
     # Install pip via get-pip.py
     && curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py \

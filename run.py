@@ -64,6 +64,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Regex filter for classifying Python files",
     )
+    parser.add_argument(
+        "--num_parallel",
+        type=int,
+        default=16,
+        required=False,
+        help="Number of parallel workers for processing",
+    )
     return parser
 
 
@@ -86,6 +93,7 @@ if __name__ == "__main__":
             "baseline": str(parsed_args.baseline),
             "itv": parsed_args.itv,
             "filter": str(parsed_args.filter),
+            "num_parallel": parsed_args.num_parallel,
         },
     )
     
@@ -98,6 +106,7 @@ if __name__ == "__main__":
             baseline=parsed_args.baseline,
             dll=parsed_args.dll,
             itv=parsed_args.itv,
-            filter=parsed_args.filter
+            filter=parsed_args.filter,
+            num_parallel=parsed_args.num_parallel
         )
         collector.collect()

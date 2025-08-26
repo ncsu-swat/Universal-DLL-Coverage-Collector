@@ -3,10 +3,11 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+import time
 from typing import Dict, List, Optional, Tuple, cast
 
 class DLLCovCollector:
-    def __init__(self, ver: str, target: str, output: str, dll: str, itv: int, baseline: str,filter: Optional[str] = None):
+    def __init__(self, ver: str, target: str, output: str, dll: str, itv: int, baseline: str, num_parallel: int, filter: Optional[str] = None):
         self.ver = ver
         self.target = target
         self.output = output
@@ -23,8 +24,15 @@ class DLLCovCollector:
         self.docker_name = f"torch_cov_{self.ver}-{baseline}" if baseline else f"torch_cov_{self.ver}"
         self.docker_id = ""
         self.result_dir = f"{output}/{baseline}"
-        
-        
+        self.num_parallel = num_parallel
+
+    def loop_until_control_c(self):
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("Received Ctrl+C, exiting...")
+
     def check_image(self):
         # use docker image to check
         cmd = ["docker", "images", "-q", self.docker_image]
@@ -57,6 +65,21 @@ class DLLCovCollector:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to remove Docker container: {result.stderr.strip()}")
+
+    def restart_docker(self):
+        # check if the docker is running
+        cmd = ["docker", "ps", "-q", "-f", f"name={self.docker_name}"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to check Docker container status: {result.stderr.strip()}")
+        container_id = result.stdout.strip()
+        if container_id:
+            print(f"Stopping running Docker container {self.docker_name}")
+            self.stop_docker()
+            print(f"Removing Docker container {self.docker_name}")
+            self.rm_docker()
+        print(f"Starting Docker container {self.docker_name}")
+        self.start_docker()
 
     def classify_python_files_with_itv(self, regex_pattern: Optional[str] = None) -> Dict[str, int]:
         """
@@ -292,12 +315,14 @@ class DLLCovCollector:
                 raise FileNotFoundError(f"Driver not found: {driver_host}")
             driver_container = f"{container_root}/{self.driver}"
             self.copy_to_docker(driver_host, driver_container)
+            torch_driver_host = os.path.join(os.path.dirname(__file__), "scripts","torch_driver.py")
+            torch_driver = f"{container_root}/scripts/torch_driver.py"
+            self.copy_to_docker(torch_driver_host, torch_driver)
 
             # 3) For each interval bucket, copy inputs and execute all .py (single driver call per bucket)
             # bucket directories directly under self.result_dir
             interval_dirs = sorted([p for p in result_root.iterdir() if p.is_dir()])
             for bucket_dir in interval_dirs:
-                self.start_docker()
                 print(f"Processing bucket: {bucket_dir.name}")
                 bucket_label = bucket_dir.name
                 # Copy this interval into container
@@ -309,19 +334,18 @@ class DLLCovCollector:
                 mkp = self.exec_in_docker(["mkdir", "-p", f"{profraw_root}/{bucket_label}"])
                 if mkp.returncode != 0:
                     raise RuntimeError(f"Failed to mkdir for profraw: {mkp.stderr.strip()}")
-
                 # Run driver once for the entire bucket
                 run = self.exec_in_docker([
                     "python", driver_container,
                     "--inputs-dir", container_bucket_dir,
                     "--profraw-root", f"{profraw_root}/{bucket_label}",
                     "--profdata-out", f"{profraw_root}/{bucket_label}/merged.profdata",
-                    "--jobs", "16",
-                    "--timeout-sec", "5"
+                    "--jobs", f"{self.num_parallel}",
+                    "--timeout-sec", f"{self.itv*2}"
                 ], workdir=container_root)
                 if run.returncode != 0:
                     print(f"[WARN] Driver failed for bucket {bucket_label}: {run.stderr.strip()}\n{run.stdout}")
-
+                
                 # 4) Copy profraws for this bucket back to host
                 host_prof_bucket = Path(self.output) / "profdata" / baseline_name / bucket_label
                 os.makedirs(host_prof_bucket, exist_ok=True)
@@ -332,8 +356,6 @@ class DLLCovCollector:
                     self.copy_from_docker(f"{profraw_root}/{bucket_label}/profile.log", str(host_prof_bucket))
                 except RuntimeError as e:
                     print(f"[WARN] Failed to copy profraws for {bucket_label}: {e}")
-                self.stop_docker()
-            self.start_docker()
             print("Success")
         except Exception as e:
             print("Fail:", e)

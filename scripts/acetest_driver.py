@@ -7,11 +7,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed, Future
 from pathlib import Path
 from typing import Optional, List, Tuple
 
+def _run_subdir(subdir: Path, torch_driver: Path, prof: Path, timeout: int) -> Tuple[str, int, str, str]:
+	"""Run torch_driver.py on a subdirectory with LLVM_PROFILE_FILE set.
 
-def _run_one(py: Path, prof: Path, timeout: int) -> Tuple[str, int, str, str]:
-	"""Run a single Python file in a subprocess with LLVM_PROFILE_FILE set.
-
-	Returns: (relpath, returncode, stdout, stderr)
+	Returns: (subdir, returncode, stdout, stderr)
 	"""
 	prof.parent.mkdir(parents=True, exist_ok=True)
 	env = os.environ.copy()
@@ -29,16 +28,22 @@ def _run_one(py: Path, prof: Path, timeout: int) -> Tuple[str, int, str, str]:
 		"TF_NUM_INTRAOP_THREADS": "1",
 		"TF_NUM_INTEROP_THREADS": "1",
 	})
+	cmd = [
+		sys.executable,
+		str(torch_driver),
+		"--inputs-dir",
+		str(subdir),
+	]
 	try:
 		proc = subprocess.run(
-			[sys.executable, str(py)],
-			cwd=str(py.parent),
+			cmd,
+			cwd=str(subdir),
 			text=True,
 			capture_output=True,
 			env=env,
 			timeout=timeout,
 		)
-		return (str(py), proc.returncode, proc.stdout, proc.stderr)
+		return (str(subdir), proc.returncode, proc.stdout, proc.stderr)
 	except subprocess.TimeoutExpired as te:
 		if isinstance(te.stdout, (bytes, bytearray)):
 			stdout = te.stdout.decode(errors="ignore")
@@ -48,9 +53,9 @@ def _run_one(py: Path, prof: Path, timeout: int) -> Tuple[str, int, str, str]:
 			stderr = te.stderr.decode(errors="ignore")
 		else:
 			stderr = str(te.stderr) if te.stderr is not None else f"Timeout after {timeout}s"
-		return (str(py), 124, stdout, stderr)
+		return (str(subdir), 124, stdout, stderr)
 	except Exception as e:
-		return (str(py), 1, "", f"Exception: {e}")
+		return (str(subdir), 1, "", f"Exception: {e}")
 
 
 def _find_profdata_tool() -> Optional[str]:
@@ -73,11 +78,11 @@ def _find_profdata_tool() -> Optional[str]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-	parser = argparse.ArgumentParser(description="ACETest driver: run interval with multiprocessing and merge coverage")
-	parser.add_argument("--inputs-dir", required=True, help="Directory containing Python files (recursively)")
+	parser = argparse.ArgumentParser(description="ACETest driver: run torch_driver per subdirectory and merge coverage")
+	parser.add_argument("--inputs-dir", required=True, help="Top-level directory containing subdirectories of Python files")
 	parser.add_argument("--profraw-root", required=True, help="Root directory for .profraw outputs")
 	parser.add_argument("--profdata-out", required=True, help="Path to write merged .profdata output")
-	parser.add_argument("--timeout-sec", type=int, default=30, help="Per-file timeout in seconds")
+	parser.add_argument("--timeout-sec", type=int, default=180, help="Per-subdir timeout in seconds")
 	parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1), help="Parallel worker processes")
 	args = parser.parse_args(argv)
 
@@ -93,35 +98,41 @@ def main(argv: Optional[List[str]] = None) -> int:
 	profroot_path.mkdir(parents=True, exist_ok=True)
 	profdata_out.parent.mkdir(parents=True, exist_ok=True)
 
-	# Discover python files
-	py_files = sorted(inputs_dir.rglob("*.py"))
-	if not py_files:
-		print("[driver] No Python files found under inputs-dir", file=sys.stderr)
+	# Find torch_driver.py
+	torch_driver = Path(__file__).parent / "torch_driver.py"
+	if not torch_driver.exists():
+		print(f"[driver] torch_driver.py not found at {torch_driver}", file=sys.stderr)
 		return 2
 
-	print(f"[driver] Running {len(py_files)} files with {jobs} workers, timeout={timeout}s")
+	# Discover subdirectories directly under inputs_dir
+	subdirs = sorted([p for p in inputs_dir.iterdir() if p.is_dir()])
+	if not subdirs:
+		print("[driver] No subdirectories found under inputs-dir", file=sys.stderr)
+		return 2
 
-	# Dispatch work across processes
+	print(f"[driver] Running torch_driver for {len(subdirs)} subdirs with {jobs} workers, timeout={timeout}s")
+
+	# Dispatch work across processes: one .profraw per subdir
 	futures: List[Future[Tuple[str, int, str, str]]] = []
 	results: List[Tuple[str, int, str, str]] = []
 	with ProcessPoolExecutor(max_workers=jobs) as exe:
-		for py in py_files:
-			rel = py.relative_to(inputs_dir)
-			out_prof = profroot_path / rel.with_suffix(".profraw")
-			futures.append(exe.submit(_run_one, py, out_prof, timeout))
+		for sd in subdirs:
+			rel = sd.relative_to(inputs_dir)
+			out_prof = profroot_path / rel / "coverage.profraw"
+			futures.append(exe.submit(_run_subdir, sd, torch_driver, out_prof, timeout))
 		for fut in as_completed(futures):
 			results.append(fut.result())
 
 	# Report
 	failures = 0
-	for (py_str, rc, out, err) in results:
-		rel_str = os.path.relpath(py_str, str(inputs_dir))
+	for (sd_str, rc, out, err) in results:
+		rel_str = os.path.relpath(sd_str, str(inputs_dir))
 		if rc == 0:
-			print(f"[driver] OK {rel_str}")
+			print(f"[driver] OK subdir {rel_str}")
 		elif rc == 124:
-			print(f"[driver] TIMEOUT {rel_str}", file=sys.stderr)
+			print(f"[driver] TIMEOUT subdir {rel_str}", file=sys.stderr)
 		else:
-			print(f"[driver] FAIL {rel_str} rc={rc}", file=sys.stderr)
+			print(f"[driver] FAIL subdir {rel_str} rc={rc}", file=sys.stderr)
 			if out:
 				print(out)
 			if err:
@@ -138,7 +149,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 	if not tool:
 		print("[driver] llvm-profdata not found", file=sys.stderr)
 		return 1
-	merge_cmd = [tool, "merge", "--num-threads=0", "-sparse", "-o", str(profdata_out)] + all_profraws
+	merge_cmd = [tool, "merge", "--num-threads=0", "--failure-mode=all" ,"-sparse", "-o", str(profdata_out)] + all_profraws
 	print(f"[driver] Merging {len(all_profraws)} profraw -> {profdata_out}")
 	merge = subprocess.run(merge_cmd, capture_output=True, text=True)
 	if merge.returncode != 0:
@@ -146,12 +157,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 		print(merge.stderr, file=sys.stderr)
 		return merge.returncode
 
-	# Cleanup profraws to avoid space usage
-	try:
-		shutil.rmtree(profroot_path)
-		print(f"[driver] Cleaned up {profroot_path}")
-	except Exception as e:
-		print(f"[driver] Warning: failed to cleanup profraws: {e}", file=sys.stderr)
 
 	# Exit non-zero if any test failed, but merge succeeded
 	if failures:
