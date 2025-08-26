@@ -1,6 +1,5 @@
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed, Future
