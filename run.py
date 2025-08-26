@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--baseline",
         type=str,
-        required=False,
+        required=True,
         default=None,
         help="Baseline method",
     )
@@ -56,6 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=60,
         required=False,
         help="Interval in seconds for classifying Python files",
+    )
+    parser.add_argument(
+        "--filter",
+        type=str,
+        required=False,
+        default=None,
+        help="Regex filter for classifying Python files",
     )
     return parser
 
@@ -78,17 +85,19 @@ if __name__ == "__main__":
             "output": str(parsed_args.output),
             "baseline": str(parsed_args.baseline),
             "itv": parsed_args.itv,
+            "filter": str(parsed_args.filter),
         },
     )
     
     
     if parsed_args.dll == "torch":
-        collector = cov.DLLCovCollector(
+        collector = cov.TorchCovCollector(
             ver=parsed_args.ver,
             target=parsed_args.target,
             output=parsed_args.output,
             baseline=parsed_args.baseline,
             dll=parsed_args.dll,
-            itv=parsed_args.itv
+            itv=parsed_args.itv,
+            filter=parsed_args.filter
         )
         collector.collect()
