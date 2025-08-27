@@ -14,7 +14,7 @@ except Exception:  # pragma: no cover - if bs4 missing, fallback parser will be 
     Tag = None  # type: ignore
 
 class DLLCovCollector:
-    def __init__(self, ver: str, target: str, output: str, dll: str, itv: int, baseline: str, num_parallel: int, filter: Optional[str] = None):
+    def __init__(self, ver: str, target: str, output: str, dll: str, itv: int, baseline: str, num_parallel: int, filter: Optional[str] = None, max_time_sec: Optional[int] = 600):
         self.ver = ver
         self.target = target
         self.output = output
@@ -32,6 +32,13 @@ class DLLCovCollector:
         self.docker_id = ""
         self.result_dir = f"{output}/{baseline}"
         self.num_parallel = num_parallel
+        # Max time horizon for bucketing (seconds). If None or <=0, no cutoff.
+        try:
+            self.max_time_sec = int(max_time_sec) if max_time_sec is not None else None
+        except Exception:
+            self.max_time_sec = None
+        if self.max_time_sec is not None and self.max_time_sec <= 0:
+            self.max_time_sec = None
 
     def loop_until_control_c(self):
         try:
@@ -176,14 +183,27 @@ class DLLCovCollector:
             print(f"Group '{group or 'ROOT'}' min_ts: {group_min}, max_ts: {group_max}")
 
             def bucket_label_g(ts: float) -> str:
+                # Compute offset in seconds from group min
                 offset = max(0, int(ts - group_min))
+                # Apply cutoff: if max_time_sec is set, map offset == max_time to last bucket; skip if > max_time
+                if self.max_time_sec is not None:
+                    if offset > self.max_time_sec:
+                        return "__SKIP__"
+                    # include exact max boundary in the last bucket
+                    if offset == self.max_time_sec:
+                        offset = self.max_time_sec - 1
                 start = (offset // self.itv) * self.itv
                 end = start + self.itv
+                if self.max_time_sec is not None and end > self.max_time_sec:
+                    end = self.max_time_sec
                 return f"{start}-{end}"
 
             for full, ts in group_files:
                 total += 1
                 label = bucket_label_g(ts)
+                if label == "__SKIP__":
+                    # Beyond max_time_sec cutoff
+                    continue
                 counts[label] = counts.get(label, 0) + 1
 
                 # Build destination dir: result_dir/label/<group>/path-within-group-parent

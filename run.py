@@ -71,6 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
         required=False,
         help="Number of parallel workers for processing",
     )
+    parser.add_argument(
+        "--max-time-sec",
+        type=int,
+        default=600,
+        required=False,
+        help="Maximum time horizon in seconds for interval buckets (e.g., 600 -> only 0-60, ..., 540-600). Use <=0 to disable cutoff.",
+    )
     return parser
 
 
@@ -94,6 +101,7 @@ if __name__ == "__main__":
             "itv": parsed_args.itv,
             "filter": str(parsed_args.filter),
             "num_parallel": parsed_args.num_parallel,
+            "max_time_sec": parsed_args.max_time_sec,
         },
     )
     
@@ -107,7 +115,8 @@ if __name__ == "__main__":
             dll=parsed_args.dll,
             itv=parsed_args.itv,
             filter=parsed_args.filter,
-            num_parallel=parsed_args.num_parallel
+            num_parallel=parsed_args.num_parallel,
+            max_time_sec=parsed_args.max_time_sec,
         )
         collector.collect()
     elif parsed_args.dll == "tf":
@@ -119,6 +128,7 @@ if __name__ == "__main__":
             dll=parsed_args.dll,
             itv=parsed_args.itv,
             filter=parsed_args.filter,
-            num_parallel=parsed_args.num_parallel
+            num_parallel=parsed_args.num_parallel,
+            max_time_sec=parsed_args.max_time_sec,
         )
         collector.collect()
