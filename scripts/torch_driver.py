@@ -4,6 +4,17 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
+# Pre-import torch and numpy (if available) and inject into executed scripts' globals.
+try:  # Lazy-friendly: don't fail if not present in this environment
+    import torch as _torch  # type: ignore
+except Exception:  # pragma: no cover
+    _torch = None  # type: ignore
+
+try:
+    import numpy as _np  # type: ignore
+except Exception:  # pragma: no cover
+    _np = None  # type: ignore
+
 
 def run_file_with_exec(py_file: Path) -> int:
     """Execute a Python file using compile/exec in an isolated globals dict.
@@ -24,6 +35,13 @@ def run_file_with_exec(py_file: Path) -> int:
         "__cached__": None,
         "__builtins__": __builtins__,
     }
+
+    # Inject commonly used modules
+    if _torch is not None:
+        g["torch"] = _torch
+    if _np is not None:
+        g["np"] = _np
+        g["numpy"] = _np
 
     # Temporarily adjust cwd and sys.path so relative imports/files work
     old_cwd = Path.cwd()
