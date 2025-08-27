@@ -6,6 +6,13 @@ from pathlib import Path
 import time
 from typing import Dict, List, Optional, Tuple, cast
 
+# Optional dependency for parsing llvm-cov HTML output
+try:
+    from bs4 import BeautifulSoup, Tag  # type: ignore
+except Exception:  # pragma: no cover - if bs4 missing, fallback parser will be used
+    BeautifulSoup = None  # type: ignore
+    Tag = None  # type: ignore
+
 class DLLCovCollector:
     def __init__(self, ver: str, target: str, output: str, dll: str, itv: int, baseline: str, num_parallel: int, filter: Optional[str] = None):
         self.ver = ver
@@ -272,6 +279,117 @@ class DLLCovCollector:
         cmd += args
         return subprocess.run(cmd, capture_output=True, text=True)
 
+    # ---- Coverage utilities ----
+    def _find_tool(self, names: List[str]) -> Optional[str]:
+        """Return the first available tool name inside the container by probing --version."""
+        for n in names:
+            res = self.exec_in_docker([n, "--version"])  # type: ignore[list-item]
+            if res.returncode == 0:
+                return n
+        return None
+
+    def _find_libtorch(self) -> Optional[str]:
+        """Attempt to locate libtorch_cpu.so inside the container (preferred binary for llvm-cov)."""
+        preferred = "/root/pytorch/build/lib/libtorch_cpu.so"
+        chk = self.exec_in_docker(["bash", "-lc", f"test -f {preferred}"])
+        if chk.returncode == 0:
+            return preferred
+        # Fallback common places
+        candidates = [
+            "/root/pytorch/torch/lib/libtorch_cpu.so",
+        ]
+        for c in candidates:
+            chk2 = self.exec_in_docker(["bash", "-lc", f"test -f {c}"])
+            if chk2.returncode == 0:
+                return c
+        # Fallback to searching (best-effort)
+        find = self.exec_in_docker(["bash", "-lc", "set -o pipefail; find /root -type f -name libtorch_cpu.so 2>/dev/null | head -n1"])
+        if find.returncode == 0 and find.stdout.strip():
+            return find.stdout.strip().splitlines()[0]
+        return None
+
+    def _merge_profdata_in_container(self, out_path: str, inputs: List[str]) -> None:
+        tool = self._find_tool(["llvm-profdata", "llvm-profdata-18", "llvm-profdata-17"])
+        if not tool:
+            raise RuntimeError("llvm-profdata not found in container")
+        cmd = [tool, "merge", "--num-threads=0", "--failure-mode=all", "-sparse", "-o", out_path] + inputs
+        res = self.exec_in_docker(cmd)
+        if res.returncode != 0:
+            raise RuntimeError(f"llvm-profdata merge failed: {res.stderr}\n{res.stdout}")
+
+    def _llvm_cov_show_html(self, binaries: List[str], instr_profile: str, html_dir: str) -> None:
+        tool = self._find_tool(["llvm-cov", "llvm-cov-18", "llvm-cov-17"])
+        if not tool:
+            raise RuntimeError("llvm-cov not found in container")
+        # ensure output dir exists and is empty
+        self.exec_in_docker(["bash", "-lc", f"rm -rf {html_dir} && mkdir -p {html_dir}"])
+        cmd = [tool, "show", *binaries, "--show-branches=count", f"--instr-profile={instr_profile}", "-format=html", f"-output-dir={html_dir}"]
+        res = self.exec_in_docker(cmd)
+        if res.returncode != 0:
+            raise RuntimeError(f"llvm-cov show failed: {res.stderr}\n{res.stdout}")
+
+    @staticmethod
+    def extract_coverage_data(html_content: str, required_substrings: List[str]) -> Tuple[List[Tuple[str, int, int]], int, int]:
+        """
+        Parse llvm-cov HTML index and collect covered lines for files whose path
+        contains ALL required_substrings (logical AND). Returns:
+            - list of (path, covered_lines, total_lines)
+            - sum_covered
+            - sum_total
+        """
+        # Fallback simple parser if BeautifulSoup is unavailable
+        if BeautifulSoup is None or Tag is None:
+            results: List[Tuple[str, int, int]] = []
+            sum_cov = 0
+            sum_tot = 0
+            # Heuristic pairing
+            # Find tuples like: some path text followed by (covered/total)
+            link_texts = re.findall(r">([^<>]+)</a>", html_content)
+            nums = re.findall(r"\((\d+)/(\d+)\)", html_content)
+            for path, (cov, tot) in zip(link_texts, nums):
+                if required_substrings and not all(sub in path for sub in required_substrings):
+                    continue
+                c = int(cov)
+                t = int(tot)
+                results.append((path, c, t))
+                sum_cov += c
+                sum_tot += t
+            return results, sum_cov, sum_tot
+
+        soup = BeautifulSoup(html_content, 'html.parser')
+        rows = soup.find_all('tr', class_='light-row')
+
+        results = []
+        sum_cov = 0
+        sum_tot = 0
+
+        for row in rows:
+            if not isinstance(row, Tag):
+                continue
+            tds = [td for td in row.find_all('td') if isinstance(td, Tag)]
+            if len(tds) < 5:
+                continue
+            link = tds[0].find('a')
+            if not isinstance(link, Tag):
+                continue
+            path = link.get_text(strip=True)
+            if required_substrings and not all(sub in path for sub in required_substrings):
+                continue
+            pre_tag = tds[4].find('pre')
+            if not pre_tag:
+                continue
+            coverage_text = pre_tag.get_text(strip=True)
+            m = re.search(r"\((\d+)/(\d+)\)", coverage_text)
+            if not m:
+                continue
+            covered = int(m.group(1))
+            total = int(m.group(2))
+            results.append((path, covered, total))
+            sum_cov += covered
+            sum_tot += total
+
+        return results, sum_cov, sum_tot
+
     def collect(self):
         try:
             # 1) Determine interval directories: if target already has interval buckets (\d+-\d+), use them;
@@ -322,40 +440,113 @@ class DLLCovCollector:
             # 3) For each interval bucket, copy inputs and execute all .py (single driver call per bucket)
             # bucket directories directly under self.result_dir
             interval_dirs = sorted([p for p in result_root.iterdir() if p.is_dir()])
+
+            # Prepare cumulative profdata and coverage output paths inside container
+            cumulative_prof = f"{profraw_root}/cumulative.profdata"
+            coverage_summary: Dict[str, int] = {}
+
+            # Locate libtorch once (binary for llvm-cov)
+            libtorch = self._find_libtorch()
+            if not libtorch:
+                raise RuntimeError("libtorch_cpu.so not found in container")
+
+            html_root = f"{container_root}/cov-html"
+            mkh = self.exec_in_docker(["mkdir", "-p", html_root])
+            if mkh.returncode != 0:
+                raise RuntimeError(f"Failed to create html dir: {mkh.stderr.strip()}")
+
             for bucket_dir in interval_dirs:
                 print(f"Processing bucket: {bucket_dir.name}")
                 bucket_label = bucket_dir.name
-                # Copy this interval into container
-                container_bucket_dir = f"{inputs_root}/{bucket_label}"
-                # Copy the bucket directory under inputs_root, resulting in inputs_root/bucket_label
-                self.copy_to_docker(str(bucket_dir), inputs_root)
+                host_prof_bucket = Path(self.output) / "profdata" / baseline_name / bucket_label
+                host_prof_bucket.mkdir(parents=True, exist_ok=True)
+                host_prof_file = host_prof_bucket / "merged.profdata"
 
                 # Ensure profraw bucket directory exists in container
                 mkp = self.exec_in_docker(["mkdir", "-p", f"{profraw_root}/{bucket_label}"])
                 if mkp.returncode != 0:
                     raise RuntimeError(f"Failed to mkdir for profraw: {mkp.stderr.strip()}")
-                # Run driver once for the entire bucket
-                run = self.exec_in_docker([
-                    "python", driver_container,
-                    "--inputs-dir", container_bucket_dir,
-                    "--profraw-root", f"{profraw_root}/{bucket_label}",
-                    "--profdata-out", f"{profraw_root}/{bucket_label}/merged.profdata",
-                    "--jobs", f"{self.num_parallel}",
-                    "--timeout-sec", f"{self.itv*2}"
-                ], workdir=container_root)
-                if run.returncode != 0:
-                    print(f"[WARN] Driver failed for bucket {bucket_label}: {run.stderr.strip()}\n{run.stdout}")
+
+                if host_prof_file.exists():
+                    # Reuse existing result; copy into container
+                    print(f"[resume] Found existing profdata for {bucket_label}, reusing")
+                    self.copy_to_docker(str(host_prof_file), f"{profraw_root}/{bucket_label}/merged.profdata")
+                else:
+                    # Copy this interval into container and run driver
+                    container_bucket_dir = f"{inputs_root}/{bucket_label}"
+                    self.copy_to_docker(str(bucket_dir), inputs_root)
+                    run = self.exec_in_docker([
+                        "python", driver_container,
+                        "--inputs-dir", container_bucket_dir,
+                        "--profraw-root", f"{profraw_root}/{bucket_label}",
+                        "--profdata-out", f"{profraw_root}/{bucket_label}/merged.profdata",
+                        "--jobs", f"{self.num_parallel}",
+                        "--timeout-sec", f"{self.itv*2}"
+                    ], workdir=container_root)
+                    if run.returncode != 0:
+                        print(f"[WARN] Driver failed for bucket {bucket_label}: {run.stderr.strip()}\n{run.stdout}")
+                    # Copy fresh results to host for future resume
+                    try:
+                        self.copy_from_docker(f"{profraw_root}/{bucket_label}/merged.profdata", str(host_prof_bucket))
+                        self.copy_from_docker(f"{profraw_root}/{bucket_label}/profile.log", str(host_prof_bucket))
+                    except RuntimeError as e:
+                        print(f"[WARN] Failed to copy profraws for {bucket_label}: {e}")
                 
-                # 4) Copy profraws for this bucket back to host
-                host_prof_bucket = Path(self.output) / "profdata" / baseline_name / bucket_label
-                os.makedirs(host_prof_bucket, exist_ok=True)
+                # Merge cumulatively: previous cumulative + current bucket -> new cumulative
+                bucket_prof = f"{profraw_root}/{bucket_label}/merged.profdata"
+                exists = self.exec_in_docker(["bash", "-lc", f"test -f {cumulative_prof}"])
+                if exists.returncode == 0:
+                    tmp_out = f"{profraw_root}/cumulative.tmp.profdata"
+                    self._merge_profdata_in_container(tmp_out, [cumulative_prof, bucket_prof])
+                    mv = self.exec_in_docker(["bash", "-lc", f"mv -f {tmp_out} {cumulative_prof}"])
+                    if mv.returncode != 0:
+                        raise RuntimeError(f"Failed to update cumulative profdata: {mv.stderr}")
+                else:
+                    cp = self.exec_in_docker(["bash", "-lc", f"cp -f {bucket_prof} {cumulative_prof}"])
+                    if cp.returncode != 0:
+                        raise RuntimeError(f"Failed to init cumulative profdata: {cp.stderr}")
+
+                # Generate HTML coverage for cumulative profile and parse ATen coverage
+                html_dir = f"{html_root}/{bucket_label}"
                 try:
-                    # Copy contents of the bucket (avoid duplicating the bucket folder name)
-                    self.copy_from_docker(f"{profraw_root}/{bucket_label}/merged.profdata", str(host_prof_bucket))
-                    # copy profile.log
-                    self.copy_from_docker(f"{profraw_root}/{bucket_label}/profile.log", str(host_prof_bucket))
-                except RuntimeError as e:
-                    print(f"[WARN] Failed to copy profraws for {bucket_label}: {e}")
+                    self._llvm_cov_show_html([libtorch], cumulative_prof, html_dir)
+                    cat = self.exec_in_docker(["bash", "-lc", f"cat {html_dir}/index.html"])
+                    if cat.returncode != 0:
+                        raise RuntimeError(f"Failed to read index.html: {cat.stderr}")
+                    html_content = cat.stdout
+                    rows, sum_cov, sum_tot = self.extract_coverage_data(html_content, ["aten/src/ATen/native"])
+                    coverage_summary[bucket_label] = sum_cov
+
+                    # Generate a host-side text report per iteration
+                    try:
+                        report_lines: List[str] = []
+                        report_lines.append(f"Bucket: {bucket_label}")
+                        pct = (100.0 * sum_cov / sum_tot) if sum_tot > 0 else 0.0
+                        report_lines.append(f"Total (aten/src/ATen/native): {sum_cov}/{sum_tot} ({pct:.2f}%)")
+                        report_lines.append("")
+                        report_lines.append("Files:")
+                        # Sort files by covered desc, then total desc
+                        for path, covered, total in sorted(rows, key=lambda x: (-x[1], -x[2], x[0])):
+                            file_pct = (100.0 * covered / total) if total > 0 else 0.0
+                            report_lines.append(f"- {path}: {covered}/{total} ({file_pct:.2f}%)")
+                        report_content = "\n".join(report_lines) + "\n"
+                        # Ensure host bucket dir exists and write file
+                        host_prof_bucket.mkdir(parents=True, exist_ok=True)
+                        with open(host_prof_bucket / "coverage.txt", "w", encoding="utf-8") as f:
+                            f.write(report_content)
+                    except Exception as werr:
+                        print(f"[WARN] Failed to write coverage.txt for {bucket_label}: {werr}")
+                except Exception as e:
+                    print(f"[WARN] Coverage computation failed for {bucket_label}: {e}")
+                
+                # 4) Nothing else to copy if we resumed; fresh runs already copied above
+            # Print final per-bucket cumulative covered-line counts
+            if coverage_summary:
+                def key_fn(s: str) -> Tuple[int, int]:
+                    a, b = s.split('-')
+                    return (int(a), int(b))
+                for k in sorted(coverage_summary.keys(), key=key_fn):
+                    print(f"{k}: {coverage_summary[k]}")
             print("Success")
         except Exception as e:
             print("Fail:", e)
@@ -370,4 +561,7 @@ class DLLCovCollector:
 
 
 class TorchCovCollector(DLLCovCollector):
+    pass
+
+class TFCovCollector(DLLCovCollector):
     pass

@@ -1,0 +1,1 @@
+python3 run.py --dll torch --ver 2.2.0 --target /home/fqin2/ACETest-2/Tester/src/output-torch/output_torch_0 --filter ".*/non_crash/.*" --baseline acetest --num_parallel 300

@@ -110,3 +110,15 @@ if __name__ == "__main__":
             num_parallel=parsed_args.num_parallel
         )
         collector.collect()
+    elif parsed_args.dll == "tf":
+        collector = cov.TFCovCollector(
+            ver=parsed_args.ver,
+            target=parsed_args.target,
+            output=parsed_args.output,
+            baseline=parsed_args.baseline,
+            dll=parsed_args.dll,
+            itv=parsed_args.itv,
+            filter=parsed_args.filter,
+            num_parallel=parsed_args.num_parallel
+        )
+        collector.collect()
