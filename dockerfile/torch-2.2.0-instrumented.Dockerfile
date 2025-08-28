@@ -65,15 +65,13 @@ RUN git clone --branch v2.2.0 --depth 1 --recurse-submodules --shallow-submodule
 # Build and install PyTorch with coverage
 WORKDIR /root/pytorch
 ENV CC=clang-18 CXX=clang++-18 USE_CPP_CODE_COVERAGE=1 \
-    CMAKE_C_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
-    CMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping -Wno-error"
+    CMAKE_C_FLAGS="-g -O0 -fprofile-instr-generate -fcoverage-mapping" \
+    CMAKE_CXX_FLAGS="-g -O0 -fprofile-instr-generate -fcoverage-mapping -Wno-error"
 
 
 # # Note: The build process can take a very long time and consume a lot of memory.
 # # We are disabling many features to speed up the build.
-RUN USE_KINETO=0 BUILD_CAFFE2=0 USE_DISTRIBUTED=0 USE_NCCL=0 BUILD_TEST=0 USE_XNNPACK=0 \
-    USE_QNNPACK=0 USE_MIOPEN=0 BUILD_CAFFE2_OPS=0 USE_TENSORPIPE=0 CMAKE_VERBOSE_MAKEFILE=ON \
-    USE_CUDA=0 USE_CUDNN=0 USE_MKLDNN=0 USE_FBGEMM=0 USE_NNPACK=0 \
+RUN BUILD_TEST=0 USE_MKLDNN=0 USE_OPENMP=0 USE_CUDA=0 USE_NCCL=0 \
     python3 setup.py develop
 
 

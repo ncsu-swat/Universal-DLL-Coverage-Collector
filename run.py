@@ -104,8 +104,8 @@ if __name__ == "__main__":
             "max_time_sec": parsed_args.max_time_sec,
         },
     )
-    
-    
+    # Collector is a framework-agnostic base; subclasses provide specifics
+    collector: cov.DLLCovCollector
     if parsed_args.dll == "torch":
         collector = cov.TorchCovCollector(
             ver=parsed_args.ver,

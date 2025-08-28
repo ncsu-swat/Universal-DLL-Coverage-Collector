@@ -27,8 +27,13 @@ class DLLCovCollector:
         driver_path = Path(self.driver)
         if not driver_path.exists():
             raise FileNotFoundError(f"Driver script not found: {self.driver}")
-        self.docker_image = f"ncsu-swat/torch-{self.ver}-instrumented"
-        self.docker_name = f"torch_cov_{self.ver}-{baseline}" if baseline else f"torch_cov_{self.ver}"
+        # Select docker image/name based on DLL
+        if self.dll == "tf":
+            self.docker_image = f"ncsu-swat/tf-{self.ver}-instrumented"
+            self.docker_name = f"tf_cov_{self.ver}-{baseline}" if baseline else f"tf_cov_{self.ver}"
+        else:
+            self.docker_image = f"ncsu-swat/torch-{self.ver}-instrumented"
+            self.docker_name = f"torch_cov_{self.ver}-{baseline}" if baseline else f"torch_cov_{self.ver}"
         self.docker_id = ""
         self.result_dir = f"{output}/{baseline}"
         self.num_parallel = num_parallel
@@ -309,13 +314,17 @@ class DLLCovCollector:
         return None
 
     def _find_libtorch(self) -> Optional[str]:
-        """Attempt to locate libtorch_cpu.so inside the container (preferred binary for llvm-cov)."""
+        """Attempt to locate libtorch.so inside the container (preferred binary for llvm-cov)."""
+        # Prefer libtorch.so if present (as requested)
         preferred = "/root/pytorch/build/lib/libtorch_cpu.so"
         chk = self.exec_in_docker(["bash", "-lc", f"test -f {preferred}"])
         if chk.returncode == 0:
             return preferred
         # Fallback common places
         candidates = [
+            "/root/pytorch/torch/lib/libtorch.so",
+            # Also allow libtorch_cpu.so as a fallback
+            "/root/pytorch/build/lib/libtorch_cpu.so",
             "/root/pytorch/torch/lib/libtorch_cpu.so",
         ]
         for c in candidates:
@@ -323,13 +332,51 @@ class DLLCovCollector:
             if chk2.returncode == 0:
                 return c
         # Fallback to searching (best-effort)
-        find = self.exec_in_docker(["bash", "-lc", "set -o pipefail; find /root -type f -name libtorch_cpu.so 2>/dev/null | head -n1"])
+        find = self.exec_in_docker(["bash", "-lc", "set -o pipefail; find /root -type f -name 'libtorch*.so*' 2>/dev/null | head -n1"])
         if find.returncode == 0 and find.stdout.strip():
             return find.stdout.strip().splitlines()[0]
         return None
 
+    def _find_tf_binaries(self) -> List[str]:
+        """Locate TensorFlow instrumented shared libraries inside the container.
+
+        Target the Python extension shared libs such as _pywrap_tensorflow_internal*.so in site-packages.
+        """
+        # Prefer the user-provided canonical path if present
+        preferred = "/usr/local/lib/python3.11/dist-packages/tensorflow/libtensorflow_cc.so.2"
+        found: List[str] = []
+        chk = self.exec_in_docker(["bash", "-lc", f"test -f {preferred}"])
+        if chk.returncode == 0:
+            found.append(preferred)
+
+        patterns = [
+            "_pywrap_tensorflow_internal*.so",
+            "libtensorflow_framework*.so*",
+            "libtensorflow_cc.so*",
+        ]
+        for pat in patterns:
+            cmd = [
+                "bash", "-lc",
+                f"set -o pipefail; find /usr /usr/local /app -type f -name '{pat}' 2>/dev/null | head -n 5"
+            ]
+            res = self.exec_in_docker(cmd)
+            if res.returncode == 0 and res.stdout.strip():
+                for line in res.stdout.strip().splitlines():
+                    if line and line not in found:
+                        found.append(line)
+        return found
+
+    def _required_substrings(self) -> List[str]:
+        """Return the path filters for coverage parsing depending on the dll."""
+        if self.dll == "tf":
+            return ["tensorflow/core/kernels"]
+        # Default to PyTorch
+        return ["aten/src/ATen/native"]
+
     def _merge_profdata_in_container(self, out_path: str, inputs: List[str]) -> None:
-        tool = self._find_tool(["llvm-profdata", "llvm-profdata-18", "llvm-profdata-17"])
+        # Prefer version aligned with the image; include 14 for TF builds on Ubuntu 22.04
+        profdata_candidates = ["llvm-profdata-18", "llvm-profdata-17", "llvm-profdata-14", "llvm-profdata"]
+        tool = self._find_tool(profdata_candidates)
         if not tool:
             raise RuntimeError("llvm-profdata not found in container")
         cmd = [tool, "merge", "--num-threads=0", "--failure-mode=all", "-sparse", "-o", out_path] + inputs
@@ -338,7 +385,9 @@ class DLLCovCollector:
             raise RuntimeError(f"llvm-profdata merge failed: {res.stderr}\n{res.stdout}")
 
     def _llvm_cov_show_html(self, binaries: List[str], instr_profile: str, html_dir: str) -> None:
-        tool = self._find_tool(["llvm-cov", "llvm-cov-18", "llvm-cov-17"])
+        # Prefer version aligned with the image; include 14 for TF builds on Ubuntu 22.04
+        cov_candidates = ["llvm-cov-18", "llvm-cov-17", "llvm-cov-14", "llvm-cov"]
+        tool = self._find_tool(cov_candidates)
         if not tool:
             raise RuntimeError("llvm-cov not found in container")
         # ensure output dir exists and is empty
@@ -447,15 +496,22 @@ class DLLCovCollector:
                 if mk.returncode != 0:
                     raise RuntimeError(f"Failed to create {d} in container: {mk.stderr.strip()}")
 
-            # Copy acetest_driver into container once
+            # Copy orchestrator driver (acetest_driver.py or titanfuzz_driver.py) into container once
             driver_host = os.path.join(os.path.dirname(__file__), self.driver)
             if not os.path.exists(driver_host):
                 raise FileNotFoundError(f"Driver not found: {driver_host}")
             driver_container = f"{container_root}/{self.driver}"
             self.copy_to_docker(driver_host, driver_container)
-            torch_driver_host = os.path.join(os.path.dirname(__file__), "scripts","torch_driver.py")
+            # Copy framework-specific simple driver(s)
+            scripts_dir = os.path.join(os.path.dirname(__file__), "scripts")
+            torch_driver_host = os.path.join(scripts_dir, "torch_driver.py")
             torch_driver = f"{container_root}/scripts/torch_driver.py"
-            self.copy_to_docker(torch_driver_host, torch_driver)
+            if os.path.exists(torch_driver_host):
+                self.copy_to_docker(torch_driver_host, torch_driver)
+            tf_driver_host = os.path.join(scripts_dir, "tf_driver.py")
+            tf_driver = f"{container_root}/scripts/tf_driver.py"
+            if os.path.exists(tf_driver_host):
+                self.copy_to_docker(tf_driver_host, tf_driver)
 
             # 3) For each interval bucket, copy inputs and execute all .py (single driver call per bucket)
             # bucket directories directly under self.result_dir
@@ -465,10 +521,17 @@ class DLLCovCollector:
             cumulative_prof = f"{profraw_root}/cumulative.profdata"
             coverage_summary: Dict[str, int] = {}
 
-            # Locate libtorch once (binary for llvm-cov)
-            libtorch = self._find_libtorch()
-            if not libtorch:
-                raise RuntimeError("libtorch_cpu.so not found in container")
+            # Locate binaries once per run
+            coverage_binaries: List[str]
+            if self.dll == "tf":
+                coverage_binaries = self._find_tf_binaries()
+                if not coverage_binaries:
+                    raise RuntimeError("TensorFlow coverage binaries not found in container (e.g., _pywrap_tensorflow_internal*.so)")
+            else:
+                libtorch = self._find_libtorch()
+                if not libtorch:
+                    raise RuntimeError("libtorch.so not found in container")
+                coverage_binaries = [libtorch]
 
             html_root = f"{container_root}/cov-html"
             mkh = self.exec_in_docker(["mkdir", "-p", html_root])
@@ -501,7 +564,8 @@ class DLLCovCollector:
                         "--profraw-root", f"{profraw_root}/{bucket_label}",
                         "--profdata-out", f"{profraw_root}/{bucket_label}/merged.profdata",
                         "--jobs", f"{self.num_parallel}",
-                        "--timeout-sec", f"{self.itv*2}"
+                        "--timeout-sec", f"{self.itv*2}",
+                        "--dll", self.dll,
                     ], workdir=container_root)
                     if run.returncode != 0:
                         print(f"[WARN] Driver failed for bucket {bucket_label}: {run.stderr.strip()}\n{run.stdout}")
@@ -526,15 +590,16 @@ class DLLCovCollector:
                     if cp.returncode != 0:
                         raise RuntimeError(f"Failed to init cumulative profdata: {cp.stderr}")
 
-                # Generate HTML coverage for cumulative profile and parse ATen coverage
+                # Generate HTML coverage for cumulative profile and parse coverage
                 html_dir = f"{html_root}/{bucket_label}"
                 try:
-                    self._llvm_cov_show_html([libtorch], cumulative_prof, html_dir)
+                    self._llvm_cov_show_html(coverage_binaries, cumulative_prof, html_dir)
                     cat = self.exec_in_docker(["bash", "-lc", f"cat {html_dir}/index.html"])
                     if cat.returncode != 0:
                         raise RuntimeError(f"Failed to read index.html: {cat.stderr}")
                     html_content = cat.stdout
-                    rows, sum_cov, sum_tot = self.extract_coverage_data(html_content, ["aten/src/ATen/native"])
+                    filters = self._required_substrings()
+                    rows, sum_cov, sum_tot = self.extract_coverage_data(html_content, filters)
                     coverage_summary[bucket_label] = sum_cov
 
                     # Generate a host-side text report per iteration
@@ -542,7 +607,8 @@ class DLLCovCollector:
                         report_lines: List[str] = []
                         report_lines.append(f"Bucket: {bucket_label}")
                         pct = (100.0 * sum_cov / sum_tot) if sum_tot > 0 else 0.0
-                        report_lines.append(f"Total (aten/src/ATen/native): {sum_cov}/{sum_tot} ({pct:.2f}%)")
+                        label = "/".join(filters) if filters else "all"
+                        report_lines.append(f"Total ({label}): {sum_cov}/{sum_tot} ({pct:.2f}%)")
                         report_lines.append("")
                         report_lines.append("Files:")
                         # Sort files by covered desc, then total desc

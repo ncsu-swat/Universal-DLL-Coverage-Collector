@@ -6,8 +6,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed, Future
 from pathlib import Path
 from typing import Optional, List, Tuple
 
-def _run_subdir(subdir: Path, torch_driver: Path, prof: Path, timeout: int) -> Tuple[str, int, str, str]:
-	"""Run torch_driver.py on a subdirectory with LLVM_PROFILE_FILE set.
+def _run_subdir(subdir: Path, driver_path: Path, prof: Path, timeout: int) -> Tuple[str, int, str, str]:
+	"""Run driver (torch or tf) on a subdirectory with LLVM_PROFILE_FILE set.
 
 	Returns: (subdir, returncode, stdout, stderr)
 	"""
@@ -27,12 +27,7 @@ def _run_subdir(subdir: Path, torch_driver: Path, prof: Path, timeout: int) -> T
 		"TF_NUM_INTRAOP_THREADS": "1",
 		"TF_NUM_INTEROP_THREADS": "1",
 	})
-	cmd = [
-		sys.executable,
-		str(torch_driver),
-		"--inputs-dir",
-		str(subdir),
-	]
+	cmd = [sys.executable, str(driver_path), "--inputs-dir", str(subdir)]
 	try:
 		proc = subprocess.run(
 			cmd,
@@ -77,12 +72,13 @@ def _find_profdata_tool() -> Optional[str]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-	parser = argparse.ArgumentParser(description="ACETest driver: run torch_driver per subdirectory and merge coverage")
+	parser = argparse.ArgumentParser(description="ACETest driver: run torch/tf driver per subdirectory and merge coverage")
 	parser.add_argument("--inputs-dir", required=True, help="Top-level directory containing subdirectories of Python files")
 	parser.add_argument("--profraw-root", required=True, help="Root directory for .profraw outputs")
 	parser.add_argument("--profdata-out", required=True, help="Path to write merged .profdata output")
 	parser.add_argument("--timeout-sec", type=int, default=180, help="Per-subdir timeout in seconds")
 	parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1), help="Parallel worker processes")
+	parser.add_argument("--dll", choices=["torch", "tf"], default=os.environ.get("DLL", "torch"), help="Which framework to preload in driver")
 	args = parser.parse_args(argv)
 
 	inputs_dir = Path(args.inputs_dir)
@@ -97,11 +93,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 	profroot_path.mkdir(parents=True, exist_ok=True)
 	profdata_out.parent.mkdir(parents=True, exist_ok=True)
 
-	# Find torch_driver.py
-	torch_driver = Path(__file__).parent / "torch_driver.py"
-	if not torch_driver.exists():
-		print(f"[driver] torch_driver.py not found at {torch_driver}", file=sys.stderr)
-		return 2
+	# Select driver script based on dll
+	if args.dll == "tf":
+		driver_path = Path(__file__).parent / "tf_driver.py"
+		if not driver_path.exists():
+			print(f"[driver] tf_driver.py not found at {driver_path}", file=sys.stderr)
+			return 2
+	else:
+		driver_path = Path(__file__).parent / "torch_driver.py"
+		if not driver_path.exists():
+			print(f"[driver] torch_driver.py not found at {driver_path}", file=sys.stderr)
+			return 2
 
 	# Discover subdirectories directly under inputs_dir
 	subdirs = sorted([p for p in inputs_dir.iterdir() if p.is_dir()])
@@ -109,7 +111,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 		print("[driver] No subdirectories found under inputs-dir", file=sys.stderr)
 		return 2
 
-	print(f"[driver] Running torch_driver for {len(subdirs)} subdirs with {jobs} workers, timeout={timeout}s")
+	print(f"[driver] Running {driver_path.name} for {len(subdirs)} subdirs with {jobs} workers, timeout={timeout}s")
 
 	# Dispatch work across processes: one .profraw per subdir
 	futures: List[Future[Tuple[str, int, str, str]]] = []
@@ -118,7 +120,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 		for sd in subdirs:
 			rel = sd.relative_to(inputs_dir)
 			out_prof = profroot_path / rel / "coverage.profraw"
-			futures.append(exe.submit(_run_subdir, sd, torch_driver, out_prof, timeout))
+			futures.append(exe.submit(_run_subdir, sd, driver_path, out_prof, timeout))
 		for fut in as_completed(futures):
 			results.append(fut.result())
 
