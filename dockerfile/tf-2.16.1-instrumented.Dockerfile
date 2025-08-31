@@ -50,7 +50,6 @@ WORKDIR /usr/src/tensorflow
 # Install TensorFlow dependencies
 RUN python -m pip install --upgrade pip
 RUN python -m pip install numpy wheel packaging requests opt_einsum
-RUN python -m pip install keras_nightly
 
 # Configure TensorFlow build
 # Set CC and CXX to clang and clang++ for the build
@@ -62,6 +61,11 @@ ENV TF_SYSTEM_JEMALLOC=0
 ENV PYTHON_BIN_PATH=/usr/bin/python
 # Accept default configurations non-interactively
 ENV TF_CONFIGURE_IOS=0
+ENV USE_DEFAULT_PYTHON_LIB_PATH=1
+ENV TF_NEED_ROCM=0
+ENV TF_NEED_CUDA=0
+ENV TF_NEED_CLANG=1
+ENV TF_SET_ANDROID_WORKSPACE=0
 
 # Run configure, explicitly passing the python path
 RUN PYTHON_BIN_PATH=/usr/bin/python3.11 ./configure
@@ -71,7 +75,6 @@ RUN PYTHON_BIN_PATH=/usr/bin/python3.11 ./configure
 RUN bazel build \
     --jobs=${NJOB} \
     --config=opt \
-    --config=monolithic \
     --copt="-fprofile-instr-generate" \
     --copt="-fcoverage-mapping" \
     --linkopt="-fprofile-instr-generate" \
@@ -82,7 +85,7 @@ RUN bazel build \
 RUN ./bazel-bin/tensorflow/tools/pip_package/build_pip_package /tmp/tensorflow_pkg
 
 # # Install the built package
-RUN python -m pip install /tmp/tensorflow_pkg/tensorflow-*.whl
+# RUN python -m pip install /tmp/tensorflow_pkg/tensorflow-*.whl
 
 
 # Set a default working directory for the final image
@@ -90,6 +93,12 @@ WORKDIR /app
 
 # Copy the wheel file to the app directory so it can be easily extracted
 RUN cp /tmp/tensorflow_pkg/tensorflow-*.whl /app/
+
+# Ensure no previous TF is present (avoid mixed installs) and install our wheel directly
+RUN python -m pip uninstall -y tensorflow tensorflow-cpu tensorflow-intel tf-nightly tf-nightly-cpu || true
+RUN python -m pip install --no-cache-dir /app/tensorflow-*.whl
+
+RUN python -c "import tensorflow as tf; print(tf.__version__)"
 
 CMD ["bash"]
 

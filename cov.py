@@ -305,10 +305,16 @@ class DLLCovCollector:
         return subprocess.run(cmd, capture_output=True, text=True)
 
     # ---- Coverage utilities ----
-    def _find_tool(self, names: List[str]) -> Optional[str]:
-        """Return the first available tool name inside the container by probing --version."""
+    def _find_tool(self, names: List[str], probe_args: Optional[List[str]] = None) -> Optional[str]:
+        """Return the first available tool name inside the container by probing it.
+
+        Some LLVM builds don't support --version. Allow callers to specify a probe
+        such as ["merge", "-help"] (for llvm-profdata) or ["show", "-help"] (for llvm-cov).
+        Defaults to ["--version"].
+        """
+        probe = probe_args or ["--version"]
         for n in names:
-            res = self.exec_in_docker([n, "--version"])  # type: ignore[list-item]
+            res = self.exec_in_docker([n, *probe])  # type: ignore[list-item]
             if res.returncode == 0:
                 return n
         return None
@@ -349,21 +355,21 @@ class DLLCovCollector:
         if chk.returncode == 0:
             found.append(preferred)
 
-        patterns = [
-            "_pywrap_tensorflow_internal*.so",
-            "libtensorflow_framework*.so*",
-            "libtensorflow_cc.so*",
-        ]
-        for pat in patterns:
-            cmd = [
-                "bash", "-lc",
-                f"set -o pipefail; find /usr /usr/local /app -type f -name '{pat}' 2>/dev/null | head -n 5"
-            ]
-            res = self.exec_in_docker(cmd)
-            if res.returncode == 0 and res.stdout.strip():
-                for line in res.stdout.strip().splitlines():
-                    if line and line not in found:
-                        found.append(line)
+        # patterns = [
+        #     "_pywrap_tensorflow_internal*.so",
+        #     "libtensorflow_framework*.so*",
+        #     "libtensorflow_cc.so*",
+        # ]
+        # for pat in patterns:
+        #     cmd = [
+        #         "bash", "-lc",
+        #         f"set -o pipefail; find /usr /usr/local /app -type f -name '{pat}' 2>/dev/null | head -n 5"
+        #     ]
+        #     res = self.exec_in_docker(cmd)
+        #     if res.returncode == 0 and res.stdout.strip():
+        #         for line in res.stdout.strip().splitlines():
+        #             if line and line not in found:
+        #                 found.append(line)
         return found
 
     def _required_substrings(self) -> List[str]:
@@ -375,8 +381,8 @@ class DLLCovCollector:
 
     def _merge_profdata_in_container(self, out_path: str, inputs: List[str]) -> None:
         # Prefer version aligned with the image; include 14 for TF builds on Ubuntu 22.04
-        profdata_candidates = ["llvm-profdata-18", "llvm-profdata-17", "llvm-profdata-14", "llvm-profdata"]
-        tool = self._find_tool(profdata_candidates)
+        profdata_candidates = ["llvm-profdata-18", "llvm-profdata-17", "llvm-profdata-16", "llvm-profdata-15", "llvm-profdata-14", "llvm-profdata"]
+        tool = self._find_tool(profdata_candidates, probe_args=["merge", "-help"])
         if not tool:
             raise RuntimeError("llvm-profdata not found in container")
         cmd = [tool, "merge", "--num-threads=0", "--failure-mode=all", "-sparse", "-o", out_path] + inputs
@@ -384,15 +390,17 @@ class DLLCovCollector:
         if res.returncode != 0:
             raise RuntimeError(f"llvm-profdata merge failed: {res.stderr}\n{res.stdout}")
 
-    def _llvm_cov_show_html(self, binaries: List[str], instr_profile: str, html_dir: str) -> None:
+    def _llvm_cov_show_html(self, binaries: List[str], instr_profile: str, html_dir: str, path_equivalence: Optional[str] = None) -> None:
         # Prefer version aligned with the image; include 14 for TF builds on Ubuntu 22.04
-        cov_candidates = ["llvm-cov-18", "llvm-cov-17", "llvm-cov-14", "llvm-cov"]
-        tool = self._find_tool(cov_candidates)
+        cov_candidates = ["llvm-cov-18", "llvm-cov-17", "llvm-cov-16", "llvm-cov-15", "llvm-cov-14", "llvm-cov"]
+        tool = self._find_tool(cov_candidates, probe_args=["show", "-help"])
         if not tool:
             raise RuntimeError("llvm-cov not found in container")
         # ensure output dir exists and is empty
         self.exec_in_docker(["bash", "-lc", f"rm -rf {html_dir} && mkdir -p {html_dir}"])
         cmd = [tool, "show", *binaries, "--show-branches=count", f"--instr-profile={instr_profile}", "-format=html", f"-output-dir={html_dir}"]
+        if path_equivalence:
+            cmd.append(f"-path-equivalence={path_equivalence}")
         res = self.exec_in_docker(cmd)
         if res.returncode != 0:
             raise RuntimeError(f"llvm-cov show failed: {res.stderr}\n{res.stdout}")
@@ -514,8 +522,17 @@ class DLLCovCollector:
                 self.copy_to_docker(tf_driver_host, tf_driver)
 
             # 3) For each interval bucket, copy inputs and execute all .py (single driver call per bucket)
-            # bucket directories directly under self.result_dir
-            interval_dirs = sorted([p for p in result_root.iterdir() if p.is_dir()])
+            # Bucket directories directly under self.result_dir. Sort numerically by label start-end
+            # to ensure processing order matches printed order (cumulative coverage grows monotonically).
+            buckets_tmp: List[Tuple[Path, int, int]] = []
+            for p in result_root.iterdir():
+                if not p.is_dir():
+                    continue
+                m = re.match(r"^(\d+)-(\d+)$", p.name)
+                if not m:
+                    continue
+                buckets_tmp.append((p, int(m.group(1)), int(m.group(2))))
+            interval_dirs = [p for (p, _a, _b) in sorted(buckets_tmp, key=lambda t: (t[1], t[2]))]
 
             # Prepare cumulative profdata and coverage output paths inside container
             cumulative_prof = f"{profraw_root}/cumulative.profdata"
@@ -576,6 +593,11 @@ class DLLCovCollector:
                     except RuntimeError as e:
                         print(f"[WARN] Failed to copy profraws for {bucket_label}: {e}")
                 
+                # clean input root
+                rm = self.exec_in_docker(["rm", "-rf", inputs_root])
+                if rm.returncode != 0:
+                    print(f"[WARN] Failed to clean input root: {rm.stderr.strip()}")
+
                 # Merge cumulatively: previous cumulative + current bucket -> new cumulative
                 bucket_prof = f"{profraw_root}/{bucket_label}/merged.profdata"
                 exists = self.exec_in_docker(["bash", "-lc", f"test -f {cumulative_prof}"])
@@ -593,7 +615,10 @@ class DLLCovCollector:
                 # Generate HTML coverage for cumulative profile and parse coverage
                 html_dir = f"{html_root}/{bucket_label}"
                 try:
-                    self._llvm_cov_show_html(coverage_binaries, cumulative_prof, html_dir)
+                    if self.dll == "tf":
+                        self._llvm_cov_show_html(coverage_binaries, cumulative_prof, html_dir, path_equivalence="/proc/self/cwd/,/usr/src/tensorflow/")
+                    else:
+                        self._llvm_cov_show_html(coverage_binaries, cumulative_prof, html_dir)
                     cat = self.exec_in_docker(["bash", "-lc", f"cat {html_dir}/index.html"])
                     if cat.returncode != 0:
                         raise RuntimeError(f"Failed to read index.html: {cat.stderr}")

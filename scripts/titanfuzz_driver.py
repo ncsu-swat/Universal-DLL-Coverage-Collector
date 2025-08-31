@@ -58,12 +58,16 @@ def _find_profdata_tool() -> Optional[str]:
 		"llvm-profdata",
 		"llvm-profdata-18",
 		"llvm-profdata-17",
+		"llvm-profdata-16",
+		"llvm-profdata-15",
+		"llvm-profdata-14",
 	]
 	for c in candidates:
 		if not c:
 			continue
 		try:
-			res = subprocess.run([c, "--version"], capture_output=True, text=True)
+			# Some builds don't support --version; use a subcommand help to test availability
+			res = subprocess.run([c, "merge", "-help"], capture_output=True, text=True)
 			if res.returncode == 0:
 				return c
 		except FileNotFoundError:
